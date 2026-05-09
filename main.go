@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"logstreamer/internal/app"
+	"logstreamer/app"
 )
 
 func main() {

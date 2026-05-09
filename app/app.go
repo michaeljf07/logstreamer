@@ -11,8 +11,8 @@ import (
 
 	"github.com/fatih/color"
 
-	"logstreamer/internal/streamer"
-	"logstreamer/internal/ui"
+	"logstreamer/streamer"
+	"logstreamer/ui"
 )
 
 func Run() int {
