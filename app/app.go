@@ -11,6 +11,7 @@ import (
 
 	"github.com/fatih/color"
 
+	"logstreamer/integrations/docker"
 	"logstreamer/streamer"
 	"logstreamer/ui"
 )
@@ -56,8 +57,9 @@ func Run() int {
 
 	fmt.Println()
 	fmt.Println("Control commands:")
-	fmt.Println("  /add   start another command")
-	fmt.Println("  /quit  exit logstreamer")
+	fmt.Println("  /add    start another command")
+	fmt.Println("  /docker connect running docker container")
+	fmt.Println("  /quit   exit logstreamer")
 	fmt.Println()
 
 	for {
@@ -88,6 +90,16 @@ func Run() int {
 
 			if err := logStreamer.AddCommand(command); err != nil {
 				fmt.Fprintf(os.Stderr, "could not start command: %v\n", err)
+			}
+		case "/docker":
+			containerID, err := ui.PromptLine(inputScanner, "Container ID: ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to read container ID: %v\n", err)
+				continue
+			}
+
+			if err := docker.AddDockerCommand(logStreamer, containerID); err != nil {
+				fmt.Fprintf(os.Stderr, "could not connect to docker container: %v\n", err)
 			}
 		default:
 			fmt.Println("Unknown control command. Use /add or /quit.")
