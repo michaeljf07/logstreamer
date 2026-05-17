@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os/exec"
 	"strings"
@@ -79,7 +80,7 @@ func (s *Streamer) AddCommand(raw string) error {
 		return fmt.Errorf("start %q: %w", command, err)
 	}
 
-	s.printSystemMessage(process.label, fmt.Sprintf("started: %s", command))
+	s.PrintSystemMessage(process.label, fmt.Sprintf("started: %s", command))
 
 	s.wg.Add(3)
 	// start the goroutines to stream output from stdout and stderr
@@ -107,7 +108,7 @@ func (s *Streamer) streamOutput(process *commandProcess, pipe io.ReadCloser, str
 	}
 
 	if err := scanner.Err(); err != nil {
-		s.printSystemMessage(process.label, fmt.Sprintf("%s stream error: %v", streamName, err))
+		s.PrintSystemMessage(process.label, fmt.Sprintf("%s stream error: %v", streamName, err))
 	}
 }
 
@@ -121,17 +122,17 @@ func (s *Streamer) waitForExit(process *commandProcess) {
 	s.mu.Unlock()
 
 	if err == nil {
-		s.printSystemMessage(process.label, "completed successfully")
+		s.PrintSystemMessage(process.label, "completed successfully")
 		return
 	}
 
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		s.printSystemMessage(process.label, fmt.Sprintf("exited with status %d", exitErr.ExitCode()))
+		s.PrintSystemMessage(process.label, fmt.Sprintf("exited with status %d", exitErr.ExitCode()))
 		return
 	}
 
-	s.printSystemMessage(process.label, fmt.Sprintf("finished with error: %v", err))
+	s.PrintSystemMessage(process.label, fmt.Sprintf("finished with error: %v", err))
 }
 
 // printLogLine(process, streamName, line) prints a log line to the console prefixed with the process label and the stream name
@@ -151,13 +152,34 @@ func (s *Streamer) printLogLine(process *commandProcess, streamName string, line
 }
 
 // printSystemMessage(label, message) prints a system message to the console prefixed with [system]
-func (s *Streamer) printSystemMessage(label string, message string) {
+func (s *Streamer) PrintSystemMessage(label string, message string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	systemPrefix := color.New(color.FgWhite, color.BgBlack, color.Bold).Sprint("[system]")
 	coloredLabel := color.New(color.FgHiWhite, color.Bold).Sprintf("[%s]", strings.ToUpper(label))
 	fmt.Printf("%s %s %s\n", systemPrefix, coloredLabel, message)
+}
+
+// Prints a line as if from a named integration source (not a shell command)
+func (s *Streamer) PrintIntegrationLog(label string, streamName string, line string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Use a hash function to get a consistent color for the label
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(label))
+	idx := int(h.Sum32()) % len(s.palette)
+	labelColor := s.palette[idx]
+	
+	displayLabel := labelColor.Sprintf("[%s]", strings.ToUpper(label))
+
+	if streamName == "stderr" {
+		fmt.Printf("%s %s %s\n", displayLabel, color.New(color.FgRed).Sprint("[stderr]"), line)
+		return
+	}
+
+	fmt.Printf("%s %s\n", displayLabel, line)
 }
 
 // stopAll(s) stops all running commands
