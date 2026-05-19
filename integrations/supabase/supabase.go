@@ -9,11 +9,26 @@ import (
 	"logstreamer/streamer"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const label = "supabase"
+
+const defaultPollInterval = 8 * time.Second
+
+// Minimum and maximum backoff times for 429 responses from the Management API (to avoid rate limits)
+const min429Backoff = 15 * time.Second
+const max429Backoff = 3 * time.Minute
+
+type pollResult int
+
+const (
+	pollOK pollResult = iota
+	pollRateLimited
+	pollFailed
+)
 
 type LogResponse struct {
 	Result []json.RawMessage `json:"result"`
@@ -53,59 +68,97 @@ func AddSupabaseCommand(ctx context.Context, s *streamer.Streamer, urlOrRef stri
 
 // PollLogs requests logs periodically until ctx is cancelled, deduplicating lines across polls.
 func PollLogs(ctx context.Context, projectREF string, accessToken string, s *streamer.Streamer) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
 	s.PrintSystemMessage(label, "Started polling logs (Management API)…")
 
 	dedup := newDeduper(2000)
 	client := &http.Client{Timeout: 30 * time.Second}
 	apiURL := fmt.Sprintf("https://api.supabase.com/v1/projects/%s/analytics/endpoints/logs.all", projectREF)
 
-	pollOnce(ctx, client, apiURL, accessToken, s, dedup)
+	wait := time.Duration(0)
+	backoff := min429Backoff
 
 	for {
-		select {
-		case <-ctx.Done():
+		if !sleepOrDone(ctx, wait) {
 			s.PrintSystemMessage(label, "Stopped polling logs.")
 			return
-		case <-ticker.C:
-			pollOnce(ctx, client, apiURL, accessToken, s, dedup)
+		}
+
+		retryAfter, result, body := pollOnce(ctx, client, apiURL, accessToken, s, dedup)
+		switch result {
+		case pollRateLimited:
+			wait = maxDuration(retryAfter, backoff)
+			backoff = minDuration(backoff*2, max429Backoff)
+			s.PrintSystemMessage(label, fmt.Sprintf("Rate limited (429): %s — next poll in %v.", truncate(body, 400), wait))
+		default:
+			wait = defaultPollInterval
+			backoff = min429Backoff
 		}
 	}
 }
 
-func pollOnce(ctx context.Context, client *http.Client, apiURL string, accessToken string, s *streamer.Streamer, dedup *deduper) {
+func sleepOrDone(ctx context.Context, wait time.Duration) bool {
+	if wait <= 0 {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+			return true
+		}
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// pollOnce returns suggested wait before retry (from Retry-After when 429), the poll result, and the 429 body for logging.
+func pollOnce(
+	ctx context.Context, client *http.Client, apiURL string, accessToken string, s *streamer.Streamer, dedup *deduper,
+) (
+	next time.Duration,
+	result pollResult,
+	bodyText string,
+) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		s.PrintSystemMessage(label, fmt.Sprintf("Failed to create request: %v", err))
-		return
+		return 0, pollFailed, ""
 	}
-	req.Header.Set("Authorization", "Bearer " + accessToken)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
 		s.PrintSystemMessage(label, fmt.Sprintf("Network error: %v", err))
-		return
+		return 0, pollFailed, ""
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	rawBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		s.PrintSystemMessage(label, fmt.Sprintf("Read body: %v", err))
-		return
+		return 0, pollFailed, ""
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return retryAfterFromHeader(resp.Header), pollRateLimited, string(rawBody)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		s.PrintSystemMessage(label, fmt.Sprintf("API returned %d: %s", resp.StatusCode, string(body)))
-		return
+		s.PrintSystemMessage(label, fmt.Sprintf("API returned %d: %s", resp.StatusCode, string(rawBody)))
+		return 0, pollFailed, ""
 	}
 
 	var env LogResponse
-	if err := json.Unmarshal(body, &env); err != nil {
+	if err := json.Unmarshal(rawBody, &env); err != nil {
 		s.PrintSystemMessage(label, fmt.Sprintf("Failed to parse JSON: %v", err))
-		return
+		return 0, pollFailed, ""
 	}
 	if env.Error != nil && *env.Error != "" {
 		s.PrintSystemMessage(label, fmt.Sprintf("API error field: %s", *env.Error))
@@ -121,6 +174,53 @@ func pollOnce(ctx context.Context, client *http.Client, apiURL string, accessTok
 		}
 		s.PrintIntegrationLog(label, "stdout", line)
 	}
+	return 0, pollOK, ""
+}
+
+// retryAfterFromHeader parses Retry-After (delta-seconds or HTTP-date). Returns 0 if unset/invalid.
+func retryAfterFromHeader(h http.Header) time.Duration {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return clamp429Backoff(time.Duration(secs) * time.Second)
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return clamp429Backoff(time.Until(t))
+	}
+	return 0
+}
+
+func clamp429Backoff(d time.Duration) time.Duration {
+	if d < min429Backoff {
+		return min429Backoff
+	}
+	if d > max429Backoff {
+		return max429Backoff
+	}
+	return d
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func truncate(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit] + "…"
 }
 
 func formatLogRow(raw []byte, dedup *deduper) string {
