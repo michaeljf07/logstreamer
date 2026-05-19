@@ -2,6 +2,7 @@ package app
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,12 +13,16 @@ import (
 	"github.com/fatih/color"
 
 	"logstreamer/integrations/docker"
+	"logstreamer/integrations/supabase"
 	"logstreamer/streamer"
 	"logstreamer/ui"
 )
 
 func Run() int {
 	color.NoColor = false
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	logStreamer := streamer.New()
 	inputScanner := bufio.NewScanner(os.Stdin)
@@ -29,6 +34,7 @@ func Run() int {
 	go func() {
 		<-signals
 		fmt.Println()
+		cancel()
 		logStreamer.Shutdown()
 		os.Exit(0)
 	}()
@@ -59,6 +65,7 @@ func Run() int {
 	fmt.Println("Control commands:")
 	fmt.Println("  /add    start another command")
 	fmt.Println("  /docker connect running docker container")
+	fmt.Println("  /supabase connect remote supabase database")
 	fmt.Println("  /quit   exit logstreamer")
 	fmt.Println()
 
@@ -66,11 +73,13 @@ func Run() int {
 		line, err := ui.PromptLine(inputScanner, "logstreamer> ")
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				cancel()
 				logStreamer.Shutdown()
 				return 0
 			}
 
 			fmt.Fprintf(os.Stderr, "input error: %v\n", err)
+			cancel()
 			logStreamer.Shutdown()
 			return 1
 		}
@@ -79,6 +88,7 @@ func Run() int {
 		case "":
 			continue
 		case "/quit":
+			cancel()
 			logStreamer.Shutdown()
 			return 0
 		case "/add":
@@ -101,8 +111,22 @@ func Run() int {
 			if err := docker.AddDockerCommand(logStreamer, containerID); err != nil {
 				fmt.Fprintf(os.Stderr, "could not connect to docker container: %v\n", err)
 			}
+		case "/supabase":
+			supabaseURL, err := ui.PromptLine(inputScanner, "Supabase project URL or ref: ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to read supabase URL: %v\n", err)
+				continue
+			}
+			supabaseKey, err := ui.PromptLine(inputScanner, "Supabase personal access token: ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to read supabase key: %v\n", err)
+				continue
+			}
+			if err := supabase.AddSupabaseCommand(ctx, logStreamer, supabaseURL, supabaseKey); err != nil {
+				fmt.Fprintf(os.Stderr, "could not connect to supabase: %v\n", err)
+			}
 		default:
-			fmt.Println("Unknown control command. Use /add or /quit.")
+			fmt.Println("Unknown control command. Use /add, /docker, /supabase, or /quit.")
 		}
 	}
 }
